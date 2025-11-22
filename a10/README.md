@@ -1,0 +1,164 @@
+# Assignment: Sequence-Parallel Decoder for VAE
+
+## Overview
+
+In this assignment, you will implement input parallelism for the decoder of a Variational Autoencoder (VAE) to enable processing larger inputs. You will implement Ulysses attention (from Assignment 9) and properly handle normalization and convolution layers for input parallelism.
+
+## Background
+
+### Input Parallelism vs. Model Parallelism
+
+- **Model Parallelism**: Splits model parameters across devices (e.g., different layers on different GPUs)
+- **Input Parallelism**: Splits the input dimension across devices, allowing each device to process a portion of the input while maintaining correctness through communication
+
+### Key Components to Parallelize
+
+1. **AttnBlock**: Apply parallelism to the attention mechanism
+2. **GroupNorm**: Handle normalization across sequence-parallel dimensions
+3. **Conv2d**: Handle convolutions with sequence-parallel inputs by communicating boundary regions between devices
+4. **Upsample**: Handle upsampling operations in sequence-parallel context
+5. **Decoder**: Integrate all parallel components
+
+## Task Requirements
+
+You need to implement the following classes in `parallel_modules.py`:
+
+#### `ParallelConv2d`
+- Extends `nn.Conv2d` to work with sequence-parallel inputs
+- Inputs are split along the width dimension (W), so each process gets (B, C, H, W_local)
+- Handle input/output tensor shapes correctly when width dimension is split
+- **Communication at boundaries**: Since convolutions require neighboring pixels, you need to communicate boundary regions between devices to ensure correct convolution results at the edges of each device's width chunk
+
+#### `ParallelGroupNorm`
+- Extends `nn.GroupNorm` to work with sequence-parallel inputs
+- Normalize across the correct dimensions considering sequence parallelism
+- Handle statistics computation across devices if needed
+
+#### `ParallelAttnBlock`
+- Implement using Ulysses attention (you should already be familiar with this from Assignment 9)
+- Ensure the output matches the non-parallel version
+
+#### `ParallelUpsample`
+- Handle upsampling in sequence-parallel context
+- Ensure the upsampled output maintains correct sequence parallelism
+
+#### `ParallelDecoder`
+- Replace all components with parallel versions:
+  - `conv_in` → `ParallelConv2d`
+  - `norm_out` → `ParallelGroupNorm`
+  - `conv_out` → `ParallelConv2d`
+  - `mid.attn_1` → `ParallelAttnBlock`
+  - All `ResnetBlock` components should use parallel norms and convs
+  - All `Upsample` components → `ParallelUpsample`
+  - Any attention blocks in upsampling layers → `ParallelAttnBlock`
+
+#### `ParallelAutoEncoder`
+- Use the parallel decoder while keeping the encoder unchanged
+- Ensure the interface matches the original `AutoEncoder`
+
+
+
+## Implementation Guidelines
+
+### Sequence Dimension Handling
+
+The input to the decoder has shape `(B, C, H, W)` where:
+- `B`: batch size
+- `C`: channels
+- `H, W`: spatial dimensions
+
+For sequence parallelism, we split along the **width dimension (W)**. Each process receives a slice of the input tensor:
+- Input shape: `(B, C, H, W)`
+- Each process gets: `(B, C, H, W_local)` where `W_local = W // world_size` (approximately)
+
+For attention operations using Ulysses, you'll need to use all2all to switch between width slicing and head slicing.
+
+## Testing Guidelines
+
+### Running Tests
+
+All tests should be run distributedly using `torchrun` as standalone test scripts.
+
+#### Running All Tests Together (with world size 4)
+
+To run all standalone tests sequentially with a single distributed setup (recommended):
+
+```bash
+# Run all standalone tests with world size 4 (Not necessarily 4 GPUs)
+torchrun --nproc_per_node=4 run_all_tests.py
+```
+
+#### Running Individual Standalone Tests
+
+All test modules can be run individually as standalone scripts:
+
+```bash
+# Parallel module tests
+torchrun --nproc_per_node=4 tests/test_parallel_conv2d.py
+torchrun --nproc_per_node=4 tests/test_parallel_groupnorm.py
+torchrun --nproc_per_node=4 tests/test_parallel_upsample.py
+torchrun --nproc_per_node=4 tests/test_parallel_attn_block.py
+```
+
+### Generating Reconstructed Images
+
+The `test_reconstruction.py` script supports three separate actions that must be run in sequence:
+
+1. **encode**: Encode the input image with baseline autoencoder and save the latent code
+2. **baseline**: Decode the latent code with baseline autoencoder
+3. **test**: Decode the latent code with parallel autoencoder (requires distributed execution)
+
+To generate the reconstructed images, run:
+
+```bash
+# Step 1: Encode image and save latent code
+python test_reconstruction.py encode
+
+# Step 2: Decode with baseline autoencoder
+python test_reconstruction.py baseline
+
+# Step 3: Decode with parallel autoencoder (requires distributed execution)
+torchrun --nproc_per_node=4 python test_reconstruction.py test
+```
+
+The script will generate:
+- `latent_code.pt`: Saved latent code from encoding (generated by step 1)
+- `reconstructed_baseline.jpg`: Output from baseline autoencoder (generated by step 2)
+- `reconstructed_parallel.jpg`: Output from parallel autoencoder (generated by step 3)
+
+## Deliverables
+
+1. **`parallel_modules.py`**: Complete implementation of all parallel modules
+2. **Reconstructed images**: Two images generated by `test_reconstruction.py`:
+   - `reconstructed_baseline.jpg`: Output from baseline autoencoder
+   - `reconstructed_parallel.jpg`: Output from parallel autoencoder
+3. **Logs**: A single markdown file that includes the unit test results
+
+
+
+## Good to know
+- If you have trouble getting one of the module right, it is never a bad idea to bypass it by allgather the full input there. You only lose some marks for this and still get the other marks.
+- You can move the model to GPU if it is slow. Even one GPU is enough, and you can put all four ranks on the same GPU.
+- PyTorch All2all is not available on CPU (gloo backend).
+- Adding additional parameter or modifying parameters is a bad idea. Beacause you still want the checkpoint to work.
+
+## Bonus: Memory Profiling (extra 10% marks)
+
+Memory profiling is optional and can be done as a bonus exercise. If you want to measure memory efficiency improvements:
+
+### Memory Profiling Guidelines
+
+Use `torch.cuda.max_memory_allocated()` to measure peak memory:
+
+```python
+torch.cuda.reset_peak_memory_stats()
+# Run test
+peak_memory = torch.cuda.max_memory_allocated()
+```
+
+**Note**: Memory profiling requires GPU execution. If you're running on CPU, you can skip this bonus section.
+
+---
+
+Good luck and happy holidays! Thank you for your participation to this course. Wish you a great winter break!
+
