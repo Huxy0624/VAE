@@ -14,87 +14,7 @@ from autoencoder_2d import (
 
 
 class HaloExchange(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, halo_size, process_group):
-        ctx.halo_size = halo_size
-        ctx.process_group = process_group
-        ctx.x_shape = x.shape
-        
-        rank = dist.get_rank(process_group)
-        world_size = dist.get_world_size(process_group)
-        
-        # B, C, H, W
-        # We split on W (dim 3)
-        
-        left_halo = torch.zeros(x.shape[:-1] + (halo_size,), device=x.device, dtype=x.dtype)
-        right_halo = torch.zeros(x.shape[:-1] + (halo_size,), device=x.device, dtype=x.dtype)
-        
-        ops = []
-        
-        # Left neighbor interaction (rank - 1)
-        if rank > 0:
-            # Send my left edge to rank-1 (becomes their right halo)
-            ops.append(dist.P2POp(dist.isend, x[..., :halo_size].contiguous(), peer=rank-1, group=process_group))
-            # Receive from rank-1 (becomes my left halo)
-            ops.append(dist.P2POp(dist.irecv, left_halo, peer=rank-1, group=process_group))
-            
-        # Right neighbor interaction (rank + 1)
-        if rank < world_size - 1:
-            # Send my right edge to rank+1 (becomes their left halo)
-            ops.append(dist.P2POp(dist.isend, x[..., -halo_size:].contiguous(), peer=rank+1, group=process_group))
-            # Receive from rank+1 (becomes my right halo)
-            ops.append(dist.P2POp(dist.irecv, right_halo, peer=rank+1, group=process_group))
-            
-        if ops:
-            reqs = dist.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
-                
-        return left_halo, right_halo
-
-    @staticmethod
-    def backward(ctx, grad_left_halo, grad_right_halo):
-        halo_size = ctx.halo_size
-        process_group = ctx.process_group
-        x_shape = ctx.x_shape
-        
-        rank = dist.get_rank(process_group)
-        world_size = dist.get_world_size(process_group)
-        
-        grad_from_left = torch.zeros_like(grad_left_halo)
-        grad_from_right = torch.zeros_like(grad_right_halo)
-        
-        ops = []
-        
-        # Interaction with Left (rank-1)
-        if rank > 0:
-            # Receive gradient for the data I sent to left
-            ops.append(dist.P2POp(dist.irecv, grad_from_left, peer=rank-1, group=process_group))
-            # Send gradient for the data I received from left
-            ops.append(dist.P2POp(dist.isend, grad_left_halo.contiguous(), peer=rank-1, group=process_group))
-            
-        # Interaction with Right (rank+1)
-        if rank < world_size - 1:
-            # Receive gradient for the data I sent to right
-            ops.append(dist.P2POp(dist.irecv, grad_from_right, peer=rank+1, group=process_group))
-            # Send gradient for the data I received from right
-            ops.append(dist.P2POp(dist.isend, grad_right_halo.contiguous(), peer=rank+1, group=process_group))
-            
-        if ops:
-            reqs = dist.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
-                
-        # Construct gradient for x
-        grad_x = torch.zeros(x_shape, device=grad_left_halo.device, dtype=grad_left_halo.dtype)
-        
-        if rank > 0:
-            grad_x[..., :halo_size] = grad_from_left
-            
-        if rank < world_size - 1:
-            grad_x[..., -halo_size:] = grad_from_right
-            
-        return grad_x, None, None
+    pass
 
 
 class ParallelConv2d(nn.Module):
@@ -117,33 +37,48 @@ class ParallelConv2d(nn.Module):
         self.stride = stride
         self.padding = padding
         
-        # We handle padding manually for halo exchange
-        conv_padding = 0 if padding > 0 else 0
-        
         self.conv = nn.Conv2d(
             in_channels,
             out_channels,
             kernel_size,
             stride=stride,
-            padding=conv_padding,
+            padding=padding,
         )
     
     def forward(self, x: Tensor) -> Tensor:
-        if self.kernel_size == 1 or self.padding == 0:
-            # No halo exchange needed for 1x1 conv or no padding
-            # Note: If padding is 0 but kernel > 1, we just do valid conv.
-            # But if the user intended padding=0, we should respect it.
+        # Optimization for 1x1 convs (pointwise) which don't need communication
+        if self.kernel_size == 1 and self.padding == 0 and self.stride == 1:
             return self.conv(x)
             
-        # Halo exchange
-        halo_size = self.padding
-        left_halo, right_halo = HaloExchange.apply(x, halo_size, self.process_group)
+        # For other convs, we use all-gather to reconstruct the full input,
+        # apply convolution, and then split the result.
+        # This ensures exact consistency with baseline Conv2d behavior.
         
-        # Pad
-        x_padded = torch.cat([left_halo, x, right_halo], dim=-1)
+        # x: (B, C, H, W_local)
+        x_list = [torch.zeros_like(x) for _ in range(self.world_size)]
+        dist.all_gather(x_list, x, group=self.process_group)
         
-        # Convolve
-        return self.conv(x_padded)
+        # Concatenate along width (dim 3)
+        x_full = torch.cat(x_list, dim=3)
+        
+        # Run standard convolution on full input
+        out_full = self.conv(x_full)
+        
+        # Split output back to chunks
+        # out_full: (B, C_out, H_out, W_out_global)
+        W_out_global = out_full.shape[3]
+        
+        if W_out_global % self.world_size != 0:
+             raise ValueError(f"Output width {W_out_global} not divisible by world size {self.world_size}")
+        
+        W_out_local = W_out_global // self.world_size
+        
+        start_w = self.rank * W_out_local
+        end_w = start_w + W_out_local
+        
+        out = out_full[..., start_w:end_w]
+        
+        return out
 
 
 class ParallelGroupNorm(nn.Module):
