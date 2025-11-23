@@ -1,4 +1,4 @@
-*.safetensors
+# *.safetensors
 *.pt
 __pycache__/
 *.pyc
