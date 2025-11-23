@@ -26,7 +26,7 @@ def test_parallel_conv2d(in_channels, out_channels, kernel_size, stride, padding
     world_size = dist.get_world_size()
     process_group = dist.group.WORLD
     
-    # Use fixed seed to ensure inputs and weights are identical across ranks
+    # Ensure same initialization and input across all ranks
     set_seed(42)
     
     # Create parallel and non-parallel conv layers
@@ -91,6 +91,9 @@ def test_parallel_conv2d(in_channels, out_channels, kernel_size, stride, padding
         else:
             print(f"✓ ParallelConv2d test passed: in={in_channels}, out={out_channels}, "
                   f"kernel={kernel_size}, stride={stride}, padding={padding}")
+
+    # Wait for all ranks to finish checking
+    dist.barrier()
 
 
 def run_tests():
