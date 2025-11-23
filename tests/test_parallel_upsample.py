@@ -34,14 +34,12 @@ def test_parallel_upsample(in_channels):
     
     # Copy weights for fair comparison
     with torch.no_grad():
-        # ParallelUpsample uses ParallelConv2d which has .conv inside
+        # ParallelUpsample uses nn.Conv2d directly as .conv
         # Baseline Upsample uses Conv2d directly as .conv
         if hasattr(parallel_upsample, 'conv') and hasattr(baseline_upsample, 'conv'):
-            # parallel_upsample.conv is ParallelConv2d
-            # parallel_upsample.conv.conv is nn.Conv2d
-            baseline_upsample.conv.weight.copy_(parallel_upsample.conv.conv.weight)
+            baseline_upsample.conv.weight.copy_(parallel_upsample.conv.weight)
             if baseline_upsample.conv.bias is not None:
-                baseline_upsample.conv.bias.copy_(parallel_upsample.conv.conv.bias)
+                baseline_upsample.conv.bias.copy_(parallel_upsample.conv.bias)
     
     # Create input
     B, C, H, W = 2, in_channels, 16, 16

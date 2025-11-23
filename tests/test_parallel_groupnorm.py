@@ -1,88 +1,100 @@
-class ParallelGroupNorm(nn.Module):
+"""
+Unit tests for ParallelGroupNorm.
+
+Run with: torchrun --nproc_per_node=N tests/test_parallel_groupnorm.py
+"""
+
+import torch
+import torch.distributed as dist
+import sys
+import os
+from torch import nn
+
+# Add parent directory to path to import modules
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from test_utils import (
+    setup_distributed, cleanup_distributed, set_seed,
+    split_along_width, gather_along_width
+)
+from parallel_modules import ParallelGroupNorm
+
+def test_parallel_groupnorm(num_channels, num_groups=32):
+    """Test ParallelGroupNorm against baseline GroupNorm."""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    process_group = dist.group.WORLD
     
-    def __init__(
-        self,
-        num_groups: int,
-        num_channels: int,
-        eps: float = 1e-6,
-        affine: bool = True,
-        process_group: Optional[dist.ProcessGroup] = None,
-    ):
-        super().__init__()
-        self.process_group = process_group or dist.group.WORLD
-        self.num_groups = num_groups
-        self.num_channels = num_channels
-        self.eps = eps
-        self.affine = affine
+    set_seed(42)
+    
+    # Create parallel and baseline layers
+    parallel_gn = ParallelGroupNorm(num_groups=num_groups, num_channels=num_channels, process_group=process_group)
+    baseline_gn = nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
+    
+    # Copy weights
+    with torch.no_grad():
+        baseline_gn.weight.copy_(parallel_gn.weight)
+        baseline_gn.bias.copy_(parallel_gn.bias)
+    
+    # Create input
+    B, C, H, W = 2, num_channels, 32, 32
+    device = "cpu"
+    x_full = torch.randn(B, C, H, W, device=device)
+    
+    # Split input
+    x_chunk, _ = split_along_width(x_full, world_size, rank)
+    
+    # Forward pass
+    parallel_gn.eval()
+    baseline_gn.eval()
+    
+    with torch.no_grad():
+        out_parallel_chunk = parallel_gn(x_chunk)
+        out_baseline = baseline_gn(x_full)
+    
+    # Gather parallel outputs
+    out_parallel_list = [torch.zeros_like(out_parallel_chunk) for _ in range(world_size)]
+    dist.all_gather(out_parallel_list, out_parallel_chunk, group=process_group)
+    
+    if rank == 0:
+        # Reconstruct full output
+        out_parallel_full = gather_along_width(out_parallel_list, out_baseline.shape[3])
         
-        if self.affine:
-            # 保持和 baseline GroupNorm 同名参数，方便加载 checkpoint
-            self.weight = nn.Parameter(torch.ones(num_channels))
-            self.bias = nn.Parameter(torch.zeros(num_channels))
+        # Compare
+        diff = (out_parallel_full - out_baseline).abs().max().item()
+        if not torch.allclose(out_parallel_full, out_baseline, rtol=1e-4, atol=1e-5):
+            print(f"ERROR: ParallelGroupNorm mismatch. Max diff: {diff}")
+            raise AssertionError(f"ParallelGroupNorm mismatch. Max diff: {diff}")
         else:
-            self.register_parameter('weight', None)
-            self.register_parameter('bias', None)
+            print(f"✓ ParallelGroupNorm test passed: channels={num_channels}, groups={num_groups}, diff={diff}")
+
+def run_tests():
+    rank = dist.get_rank()
+    if rank == 0:
+        print("=" * 60)
+        print("Running ParallelGroupNorm tests")
+        print("=" * 60)
     
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        x: (N, C, H, W_local)，宽度被 sequence-parallel 切分。
-        策略：
-          - 非分布式或 world_size=1：直接用 F.group_norm（和 baseline 完全一样）
-          - 否则：
-              1）all_gather 把所有 rank 的局部块拼成完整 x_full
-              2）在 x_full 上调用一次 F.group_norm（全局统计）
-              3）按宽度切回各自 rank 的 chunk
-        这样得到的输出，和 baseline GroupNorm 在整张图上跑出来的结果数值完全一致。
-        """
-        # 非分布式 / 未初始化：退化为普通 GroupNorm
-        if (not dist.is_available()) or (not dist.is_initialized()):
-            return F.group_norm(
-                x,
-                self.num_groups,
-                self.weight,
-                self.bias,
-                self.eps,
-            )
+    test_cases = [64, 128, 256]
+    
+    for c in test_cases:
+        test_parallel_groupnorm(c)
+    
+    if rank == 0:
+        print("=" * 60)
+        print("All ParallelGroupNorm tests passed!")
+        print("=" * 60)
 
-        pg = self.process_group
-        world_size = dist.get_world_size(pg)
-        rank = dist.get_rank(pg)
+def run_all_tests():
+    try:
+        setup_distributed()
+        run_tests()
+    except Exception as e:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"Rank {rank}: Test failed with error: {e}")
+        raise
+    finally:
+        cleanup_distributed()
 
-        # 单卡时不用并行
-        if world_size == 1:
-            return F.group_norm(
-                x,
-                self.num_groups,
-                self.weight,
-                self.bias,
-                self.eps,
-            )
-
-        N, C, H, W_local = x.shape
-        assert C == self.num_channels
-
-        # 1) all_gather：拿到完整宽度
-        x_list = [torch.empty_like(x) for _ in range(world_size)]
-        dist.all_gather(x_list, x, group=pg)
-        x_full = torch.cat(x_list, dim=3)   # (N, C, H, W_global)
-
-        # 2) 在完整特征图上做一次标准 GroupNorm
-        y_full = F.group_norm(
-            x_full,
-            self.num_groups,
-            self.weight,
-            self.bias,
-            self.eps,
-        )  # (N, C, H, W_global)
-
-        # 3) 按宽度切回本 rank 的 chunk
-        W_global = y_full.shape[3]
-        assert W_global % world_size == 0, \
-            f"Output width {W_global} must be divisible by world size {world_size}"
-
-        W_chunk = W_global // world_size
-        start = rank * W_chunk
-        end = start + W_chunk
-
-        y_local = y_full[..., start:end]    # (N, C, H, W_chunk)
-        return y_local
+if __name__ == "__main__":
+    run_all_tests()
