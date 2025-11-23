@@ -48,7 +48,7 @@ def test_parallel_groupnorm(num_groups, num_channels, affine):
     world_size = dist.get_world_size()
     process_group = dist.group.WORLD
     
-    set_seed(42 + rank)
+    set_seed(42)
     
     # Create parallel and non-parallel layers
     parallel_gn = ParallelGroupNorm(

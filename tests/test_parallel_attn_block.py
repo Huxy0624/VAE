@@ -26,7 +26,7 @@ def test_parallel_attn_block(in_channels):
     world_size = dist.get_world_size()
     process_group = dist.group.WORLD
     
-    set_seed(42 + rank)
+    set_seed(42)
     
     # Create parallel and baseline attention blocks
     parallel_attn = ParallelAttnBlock(in_channels, process_group=process_group)
@@ -46,6 +46,10 @@ def test_parallel_attn_block(in_channels):
             if hasattr(parallel_attn, name) and hasattr(baseline_attn, name):
                 parallel_conv = getattr(parallel_attn, name)
                 baseline_conv = getattr(baseline_attn, name)
+                # ParallelConv2d wraps the actual conv in .conv
+                if hasattr(parallel_conv, 'conv'):
+                    parallel_conv = parallel_conv.conv
+                
                 if hasattr(parallel_conv, 'weight'):
                     baseline_conv.weight.copy_(parallel_conv.weight)
                 if hasattr(parallel_conv, 'bias') and parallel_conv.bias is not None:
