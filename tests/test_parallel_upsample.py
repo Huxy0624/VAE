@@ -26,7 +26,7 @@ def test_parallel_upsample(in_channels):
     world_size = dist.get_world_size()
     process_group = dist.group.WORLD
     
-    set_seed(42 + rank)
+    set_seed(42)
     
     # Create parallel and baseline upsample layers
     parallel_upsample = ParallelUpsample(in_channels, process_group=process_group)
