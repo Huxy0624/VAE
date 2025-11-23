@@ -536,6 +536,26 @@ class ParallelAutoEncoder(nn.Module):
                  key = key.replace(".conv.weight", ".weight")
             elif ".conv.bias" in key and "upsample" not in key:
                  key = key.replace(".conv.bias", ".bias")
+            
+            # Handle Downsample (which is not parallelized but part of Encoder)
+            # Encoder uses Downsample which has .conv (nn.Conv2d)
+            # Baseline Downsample has .conv (nn.Conv2d)
+            # So encoder.down.0.downsample.conv.weight -> encoder.down.0.downsample.conv.weight
+            # Wait, the error says: Key not found: encoder.down.0.downsample.weight (original: encoder.down.0.downsample.conv.weight)
+            # This means my_state_dict has 'encoder.down.0.downsample.conv.weight'
+            # But we are looking for 'encoder.down.0.downsample.weight' in state_dict?
+            # No, the error message I printed is: f"Key not found in checkpoint: {key} (original: {name})"
+            # So 'key' is what we constructed, and it is missing in checkpoint.
+            # 'name' is from my_state_dict.
+            # If name is 'encoder.down.0.downsample.conv.weight', my logic above:
+            # ".conv.weight" in key (True) -> replaces with ".weight"
+            # So key becomes 'encoder.down.0.downsample.weight'
+            # But checkpoint has 'encoder.down.0.downsample.conv.weight' because Encoder is standard.
+            # So we should NOT replace .conv.weight if it is inside Encoder!
+            
+            if key.startswith("encoder."):
+                # Revert changes for encoder
+                key = name
                  
             if key in state_dict:
                 # Copy data
