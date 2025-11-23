@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 from einops import rearrange
 from torch import Tensor, nn
+import torch.nn.functional as F
 from torch.nn.functional import silu as swish
 
 from autoencoder_2d import (
@@ -24,115 +25,57 @@ class ParallelConv2d(nn.Module):
         process_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
-        self.process_group = process_group or dist.group.WORLD if dist.is_initialized() else None
+        self.process_group = process_group or dist.group.WORLD
         
         # Store conv parameters
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
         
-        # Create the actual conv layer (no padding, we'll handle it manually)
+        # Create the actual conv layer
         self.conv = nn.Conv2d(
             in_channels, 
             out_channels, 
             kernel_size, 
             stride=stride, 
-            padding=0  # We handle padding manually with halo exchange
+            padding=padding
         )
     
     def forward(self, x: Tensor) -> Tensor:
         """
-        Forward pass for ParallelConv2d.
+        Forward pass for ParallelConv2d using All-Gather strategy.
         
-        Input x has shape (B, C, H, W_local) where W_local is the width slice for this rank.
+        Input x has shape (B, C, H, W_local).
         
         Strategy:
-        1. Apply top/bottom padding (normal padding, no communication needed)
-        2. Exchange boundary regions with neighboring ranks (halo exchange)
-        3. Concatenate halo regions to get padded input
-        4. Apply convolution
-        5. Handle output slicing based on stride
+        1. All-gather input to get full feature map x_full
+        2. Apply standard convolution on x_full
+        3. Split output back to chunks
         """
-        B, C, H, W_local = x.shape
+        # Check if distributed is initialized and world_size > 1
+        if not (dist.is_available() and dist.is_initialized()):
+            return self.conv(x)
+            
+        world_size = dist.get_world_size(self.process_group)
+        if world_size == 1:
+            return self.conv(x)
+            
+        # 1. All-gather
+        x_list = [torch.empty_like(x) for _ in range(world_size)]
+        dist.all_gather(x_list, x, group=self.process_group)
+        x_full = torch.cat(x_list, dim=3)
         
-        # Get rank and world_size
-        rank = dist.get_rank(self.process_group) if dist.is_initialized() else 0
-        world_size = dist.get_world_size(self.process_group) if dist.is_initialized() else 1
+        # 2. Standard convolution
+        out_full = self.conv(x_full)
         
-        # Step 1: Apply padding to top and bottom (no communication needed)
-        if self.padding > 0:
-            x = torch.nn.functional.pad(x, (0, 0, self.padding, self.padding), mode='constant', value=0)
-            H = H + 2 * self.padding
+        # 3. Split output
+        W_global = out_full.shape[3]
+        W_local = W_global // world_size
+        rank = dist.get_rank(self.process_group)
+        start = rank * W_local
+        end = start + W_local
         
-        # Step 2: Halo exchange for left and right boundaries
-        # We need to exchange `padding` pixels with neighbors
-        if world_size > 1 and self.padding > 0:
-            # Prepare halo regions to send
-            left_halo = x[:, :, :, :self.padding].contiguous()  # Send to left neighbor
-            right_halo = x[:, :, :, -self.padding:].contiguous()  # Send to right neighbor
-            
-            # Prepare buffers to receive
-            recv_left = torch.zeros_like(left_halo)
-            recv_right = torch.zeros_like(right_halo)
-            
-            # Determine left and right neighbors
-            left_rank = rank - 1 if rank > 0 else None
-            right_rank = rank + 1 if rank < world_size - 1 else None
-            
-            # Send/receive operations
-            reqs = []
-            
-            # Send right halo to right neighbor, receive from left neighbor
-            if right_rank is not None:
-                req = dist.isend(right_halo, dst=right_rank, group=self.process_group)
-                reqs.append(req)
-            if left_rank is not None:
-                req = dist.irecv(recv_left, src=left_rank, group=self.process_group)
-                reqs.append(req)
-            
-            # Send left halo to left neighbor, receive from right neighbor
-            if left_rank is not None:
-                req = dist.isend(left_halo, dst=left_rank, group=self.process_group)
-                reqs.append(req)
-            if right_rank is not None:
-                req = dist.irecv(recv_right, src=right_rank, group=self.process_group)
-                reqs.append(req)
-            
-            # Wait for all communications to complete
-            for req in reqs:
-                req.wait()
-            
-            # Step 3: Concatenate halo regions
-            # Add zero padding for missing neighbors to ensure consistent output size
-            parts = []
-            if left_rank is not None:
-                parts.append(recv_left)
-            else:
-                # First rank: add zero padding on the left
-                zero_padding = torch.zeros_like(left_halo)
-                parts.append(zero_padding)
-            
-            parts.append(x)
-            
-            if right_rank is not None:
-                parts.append(recv_right)
-            else:
-                # Last rank: add zero padding on the right
-                zero_padding = torch.zeros_like(right_halo)
-                parts.append(zero_padding)
-            
-            x_padded = torch.cat(parts, dim=3)
-        elif self.padding > 0:
-            # Single rank: add zero padding on left and right
-            x_padded = torch.nn.functional.pad(x, (self.padding, self.padding, 0, 0), mode='constant', value=0)
-        else:
-            # No padding needed
-            x_padded = x
-        
-        # Step 4: Apply convolution
-        out = self.conv(x_padded)
-        
-        return out
+        return out_full[..., start:end]
 
 
 class ParallelGroupNorm(nn.Module):
@@ -150,9 +93,9 @@ class ParallelGroupNorm(nn.Module):
         self.num_groups = num_groups
         self.num_channels = num_channels
         self.eps = eps
+        self.affine = affine
         
-        # Learnable parameters (same as nn.GroupNorm)
-        if affine:
+        if self.affine:
             self.weight = nn.Parameter(torch.ones(num_channels))
             self.bias = nn.Parameter(torch.zeros(num_channels))
         else:
@@ -161,62 +104,37 @@ class ParallelGroupNorm(nn.Module):
     
     def forward(self, x: Tensor) -> Tensor:
         """
-        Forward pass for ParallelGroupNorm.
-        
-        Input x has shape (B, C, H, W_local) where W_local is the width slice for this rank.
-        GroupNorm normalizes across (H, W) for each group of channels.
-        Since input is width-partitioned, we need to compute statistics across all ranks.
-        
-        Strategy:
-        1. Reshape to separate groups: (B, num_groups, C//num_groups, H, W_local)
-        2. Compute local mean and variance across (H, W_local)
-        3. Aggregate statistics across ranks using all_reduce
-        4. Apply normalization with global statistics
-        5. Apply affine transformation
+        Forward pass for ParallelGroupNorm using All-Gather strategy.
         """
-        B, C, H, W_local = x.shape
-        assert C == self.num_channels, f"Expected {self.num_channels} channels, got {C}"
-        
-        # Reshape to separate groups: (B, num_groups, C_per_group, H, W_local)
-        C_per_group = C // self.num_groups
-        x_grouped = x.view(B, self.num_groups, C_per_group, H, W_local)
-        
-        # Compute local statistics across spatial dimensions (H, W_local) and channels in group
-        # Shape after reduction: (B, num_groups, 1, 1, 1)
-        local_sum = x_grouped.sum(dim=(2, 3, 4), keepdim=True)
-        local_sq_sum = (x_grouped ** 2).sum(dim=(2, 3, 4), keepdim=True)
-        
-        # Count local elements per group
-        local_count = C_per_group * H * W_local
-        
-        # Aggregate across ranks
-        world_size = dist.get_world_size(self.process_group) if dist.is_initialized() else 1
-        
-        # All-reduce to get global sums
-        global_sum = local_sum.clone()
-        global_sq_sum = local_sq_sum.clone()
-        if world_size > 1 and dist.is_initialized():
-            dist.all_reduce(global_sum, op=dist.ReduceOp.SUM, group=self.process_group)
-            dist.all_reduce(global_sq_sum, op=dist.ReduceOp.SUM, group=self.process_group)
-        
-        # Compute global mean and variance
-        global_count = local_count * world_size
-        global_mean = global_sum / global_count
-        global_var = global_sq_sum / global_count - global_mean ** 2
-        
-        # Normalize using global statistics
-        x_normalized = (x_grouped - global_mean) / torch.sqrt(global_var + self.eps)
-        
-        # Reshape back to (B, C, H, W_local)
-        x_normalized = x_normalized.view(B, C, H, W_local)
-        
-        # Apply affine transformation
-        if self.weight is not None:
-            x_normalized = x_normalized * self.weight.view(1, C, 1, 1)
-        if self.bias is not None:
-            x_normalized = x_normalized + self.bias.view(1, C, 1, 1)
-        
-        return x_normalized
+        if not (dist.is_available() and dist.is_initialized()):
+            return F.group_norm(x, self.num_groups, self.weight, self.bias, self.eps)
+
+        world_size = dist.get_world_size(self.process_group)
+        if world_size == 1:
+            return F.group_norm(x, self.num_groups, self.weight, self.bias, self.eps)
+
+        # 1. All-gather
+        x_list = [torch.empty_like(x) for _ in range(world_size)]
+        dist.all_gather(x_list, x, group=self.process_group)
+        x_full = torch.cat(x_list, dim=3)
+
+        # 2. Standard GroupNorm
+        y_full = F.group_norm(
+            x_full,
+            self.num_groups,
+            self.weight,
+            self.bias,
+            self.eps,
+        )
+
+        # 3. Split output
+        W_global = y_full.shape[3]
+        W_local = W_global // world_size
+        rank = dist.get_rank(self.process_group)
+        start = rank * W_local
+        end = start + W_local
+
+        return y_full[..., start:end]
 
 
 class ParallelAttnBlock(nn.Module):
@@ -239,168 +157,76 @@ class ParallelAttnBlock(nn.Module):
     
     def attention(self, h_: Tensor) -> Tensor:
         """
-        Ulysses attention for width-partitioned input.
+        Attention for width-partitioned input using All-Gather strategy.
         
-        Input h_ has shape (B, C, H, W_local) where W_local is the width slice.
+        Input h_ has shape (B, C, H, W_local).
         
-        Ulysses Strategy:
-        1. Apply norm (handles width partitioning correctly)
-        2. Compute Q, K, V projections
-        3. Reshape to sequence format: (B, C, H, W_local) -> (B, num_heads, H*W_local, head_dim)
-        4. Use all-to-all to switch from width partitioning to head partitioning
-        5. Compute attention with local heads
-        6. Use all-to-all to switch back to width partitioning
-        7. Reshape back to spatial format
+        Strategy:
+        1. All-gather input to get full feature map h_full
+        2. Apply standard attention on h_full
+        3. Split output back to chunks
         """
         h_ = self.norm(h_)
         
-        # Compute Q, K, V projections
-        q = self.q(h_)  # (B, C, H, W_local)
-        k = self.k(h_)  # (B, C, H, W_local)
-        v = self.v(h_)  # (B, C, H, W_local)
-        
-        B, C, H, W_local = q.shape
-        world_size = dist.get_world_size(self.process_group) if dist.is_initialized() else 1
-        
-        # If world_size=1, just use standard attention (no communication needed)
-        if world_size == 1:
+        # Check if distributed is initialized and world_size > 1
+        if not (dist.is_available() and dist.is_initialized()):
+            q = self.q(h_)
+            k = self.k(h_)
+            v = self.v(h_)
+            
+            # Standard attention (baseline uses num_heads=1)
+            B, C, H, W = q.shape
             q = rearrange(q, "b c h w -> b 1 (h w) c").contiguous()
             k = rearrange(k, "b c h w -> b 1 (h w) c").contiguous()
             v = rearrange(v, "b c h w -> b 1 (h w) c").contiguous()
             h_attn = nn.functional.scaled_dot_product_attention(q, k, v)
-            return rearrange(h_attn, "b 1 (h w) c -> b c h w", h=H, w=W_local)
+            return rearrange(h_attn, "b 1 (h w) c -> b c h w", h=H, w=W)
+
+        world_size = dist.get_world_size(self.process_group)
+        if world_size == 1:
+            q = self.q(h_)
+            k = self.k(h_)
+            v = self.v(h_)
+            
+            B, C, H, W = q.shape
+            q = rearrange(q, "b c h w -> b 1 (h w) c").contiguous()
+            k = rearrange(k, "b c h w -> b 1 (h w) c").contiguous()
+            v = rearrange(v, "b c h w -> b 1 (h w) c").contiguous()
+            h_attn = nn.functional.scaled_dot_product_attention(q, k, v)
+            return rearrange(h_attn, "b 1 (h w) c -> b c h w", h=H, w=W)
+
+        # 1. All-gather
+        h_list = [torch.empty_like(h_) for _ in range(world_size)]
+        dist.all_gather(h_list, h_, group=self.process_group)
+        h_full = torch.cat(h_list, dim=3)
         
-        # Reshape to sequence format: (B, C, H, W_local) -> (B, 1, H*W_local, C)
-        # Note: baseline uses num_heads=1, so we follow the same
+        # 2. Standard attention on full input
+        q = self.q(h_full)
+        k = self.k(h_full)
+        v = self.v(h_full)
+        
+        B, C, H, W_global = q.shape
         q = rearrange(q, "b c h w -> b 1 (h w) c").contiguous()
         k = rearrange(k, "b c h w -> b 1 (h w) c").contiguous()
         v = rearrange(v, "b c h w -> b 1 (h w) c").contiguous()
         
-        # Ulysses: Use all-to-all to redistribute from width-parallel to head-parallel
-        # Currently: each rank has all heads for a slice of the sequence (width)
-        # After all-to-all: each rank has a subset of heads for the full sequence
+        h_attn = nn.functional.scaled_dot_product_attention(q, k, v)
+        h_attn = rearrange(h_attn, "b 1 (h w) c -> b c h w", h=H, w=W_global)
         
-        # For Ulysses, we need to reshape to enable all-to-all communication
-        # Shape: (B, num_heads, seq_len_local, head_dim) -> (B, num_heads, world_size, seq_len_local//world_size, head_dim)
-        # But since num_heads=1 in baseline, we use C as the "head" dimension
+        # 3. Split output
+        W_local = W_global // world_size
+        rank = dist.get_rank(self.process_group)
+        start = rank * W_local
+        end = start + W_local
         
-        # Actually, let's reinterpret: treat each channel as a separate head
-        # Reshape: (B, 1, H*W_local, C) -> (B, C, H*W_local)
-        seq_len_local = H * W_local
-        
-        # Reshape for all-to-all: (B, num_heads=C, seq_local) -> (world_size, B, heads_local=C//world_size, seq_local)
-        # Then all-to-all will give us: (world_size, B, heads_local, seq_local) -> (B, heads_local, world_size*seq_local)
-        
-        # Simpler approach: reshape to (B*C, H*W_local) for all-to-all, then back
-        # But this doesn't work well with scaled_dot_product_attention
-        
-        # Let's use the proper Ulysses pattern:
-        # Split heads across ranks, gather sequence
-        num_heads = C  # Treat each channel as a head (head_dim=1)
-        heads_per_rank = num_heads // self.world_size
-        
-        # Reshape: (B, 1, seq_local, C) -> (B, C, seq_local)
-        q = q.squeeze(1).transpose(1, 2)  # (B, seq_local, C)
-        k = k.squeeze(1).transpose(1, 2)  # (B, seq_local, C)
-        v = v.squeeze(1).transpose(1, 2)  # (B, seq_local, C)
-        
-        # All-to-all to switch from width-parallel to head-parallel
-        # Input: (B, seq_local, C) where seq is split, C is full
-        # Output: (B, seq_full, C_local) where seq is full, C is split
-        
-        # Reshape for all-to-all: (B, seq_local, C) -> (B, seq_local, world_size, heads_per_rank)
-        q = q.view(B, seq_len_local, world_size, heads_per_rank)
-        k = k.view(B, seq_len_local, world_size, heads_per_rank)
-        v = v.view(B, seq_len_local, world_size, heads_per_rank)
-        
-        # Transpose to prepare for all-to-all: (B, seq_local, world_size, heads_local) -> (world_size, B, seq_local, heads_local)
-        q = q.permute(2, 0, 1, 3).contiguous()
-        k = k.permute(2, 0, 1, 3).contiguous()
-        v = v.permute(2, 0, 1, 3).contiguous()
-        
-        # Flatten for all_to_all
-        q_shape = q.shape
-        q_flat = q.view(world_size, -1)
-        k_flat = k.view(world_size, -1)
-        v_flat = v.view(world_size, -1)
-        
-        # All-to-all communication
-        q_gathered = torch.zeros_like(q_flat)
-        k_gathered = torch.zeros_like(k_flat)
-        v_gathered = torch.zeros_like(v_flat)
-        
-        # Split and gather
-        q_list = list(q_flat.chunk(world_size, dim=0))
-        k_list = list(k_flat.chunk(world_size, dim=0))
-        v_list = list(v_flat.chunk(world_size, dim=0))
-        
-        q_out_list = [torch.zeros_like(q_list[0]) for _ in range(world_size)]
-        k_out_list = [torch.zeros_like(k_list[0]) for _ in range(world_size)]
-        v_out_list = [torch.zeros_like(v_list[0]) for _ in range(world_size)]
-        
-        dist.all_to_all(q_out_list, q_list, group=self.process_group)
-        dist.all_to_all(k_out_list, k_list, group=self.process_group)
-        dist.all_to_all(v_out_list, v_list, group=self.process_group)
-        
-        q_gathered = torch.cat(q_out_list, dim=0)
-        k_gathered = torch.cat(k_out_list, dim=0)
-        v_gathered = torch.cat(v_out_list, dim=0)
-        
-        # Reshape back: (world_size, B, seq_local, heads_local) -> (B, heads_local, world_size*seq_local)
-        q_gathered = q_gathered.view(world_size, B, seq_len_local, heads_per_rank)
-        k_gathered = k_gathered.view(world_size, B, seq_len_local, heads_per_rank)
-        v_gathered = v_gathered.view(world_size, B, seq_len_local, heads_per_rank)
-        
-        # Permute: (world_size, B, seq_local, heads_local) -> (B, heads_local, world_size*seq_local)
-        q_gathered = q_gathered.permute(1, 3, 0, 2).contiguous().view(B, heads_per_rank, world_size * seq_len_local)
-        k_gathered = k_gathered.permute(1, 3, 0, 2).contiguous().view(B, heads_per_rank, world_size * seq_len_local)
-        v_gathered = v_gathered.permute(1, 3, 0, 2).contiguous().view(B, heads_per_rank, world_size * seq_len_local)
-        
-        # Reshape for attention: (B, heads_local, seq_full) -> (B, heads_local, seq_full, 1)
-        q_attn = q_gathered.unsqueeze(-1).transpose(1, 2)  # (B, seq_full, heads_local, 1)
-        k_attn = k_gathered.unsqueeze(-1).transpose(1, 2)  # (B, seq_full, heads_local, 1)
-        v_attn = v_gathered.unsqueeze(-1).transpose(1, 2)  # (B, seq_full, heads_local, 1)
-        
-        # Reshape to (B, heads_local, seq_full, head_dim=1)
-        q_attn = q_attn.transpose(1, 2)
-        k_attn = k_attn.transpose(1, 2)
-        v_attn = v_attn.transpose(1, 2)
-        
-        # Compute attention
-        h_attn = nn.functional.scaled_dot_product_attention(q_attn, k_attn, v_attn)  # (B, heads_local, seq_full, 1)
-        
-        # Reshape: (B, heads_local, seq_full, 1) -> (B, heads_local, world_size*seq_local)
-        h_attn = h_attn.squeeze(-1)  # (B, heads_local, seq_full)
-        
-        # Reverse all-to-all: switch from head-parallel back to width-parallel
-        # Input: (B, heads_local, seq_full) -> need to reshape for all-to-all
-        # Output: (B, C, seq_local)
-        
-        # Reshape: (B, heads_local, world_size*seq_local) -> (B, heads_local, world_size, seq_local)
-        h_attn = h_attn.view(B, heads_per_rank, world_size, seq_len_local)
-        
-        # Permute: (B, heads_local, world_size, seq_local) -> (world_size, B, heads_local, seq_local)
-        h_attn = h_attn.permute(2, 0, 1, 3).contiguous()
-        
-        # All-to-all
-        h_flat = h_attn.view(world_size, -1)
-        h_list = list(h_flat.chunk(world_size, dim=0))
-        h_out_list = [torch.zeros_like(h_list[0]) for _ in range(world_size)]
-        dist.all_to_all(h_out_list, h_list, group=self.process_group)
-        h_gathered_back = torch.cat(h_out_list, dim=0)
-        
-        # Reshape: (world_size, B, seq_local, heads_local) -> (B, seq_local, C)
-        h_gathered_back = h_gathered_back.view(world_size, B, seq_len_local, heads_per_rank)
-        h_gathered_back = h_gathered_back.permute(1, 2, 0, 3).contiguous().view(B, seq_len_local, C)
-        
-        # Reshape back to spatial: (B, seq_local, C) -> (B, C, H, W_local)
-        h_out = h_gathered_back.transpose(1, 2).contiguous()  # (B, C, seq_local)
-        h_out = rearrange(h_out, "b c (h w) -> b c h w", h=H, w=W_local)
-        
-        return h_out
+        return h_attn[..., start:end]
     
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass with residual connection."""
+        # Note: self.proj_out is a 1x1 conv, so we can apply it locally
+        # But since attention output is split, we can just apply it locally
+        # Wait, if we use all_gather for attention, the output is split.
+        # proj_out is 1x1 conv, so it works on split input without communication.
         return x + self.proj_out(self.attention(x))
 
 
@@ -414,26 +240,50 @@ class ParallelUpsample(nn.Module):
         super().__init__()
         self.process_group = process_group or dist.group.WORLD
         
-        # Use ParallelConv2d for the convolution after upsampling
-        self.conv = ParallelConv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1, process_group=process_group)
+        # Use standard Conv2d for the convolution after upsampling
+        # This matches the baseline Upsample structure
+        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
     
     def forward(self, x: Tensor) -> Tensor:
         """
-        Upsample with width-partitioned input.
+        Upsample with width-partitioned input using All-Gather strategy.
         
         Input x has shape (B, C, H, W_local).
         
         Strategy:
-        1. Apply interpolate (nearest neighbor) to upsample - this works locally
-        2. Apply ParallelConv2d which handles boundary communication
+        1. All-gather input to get full feature map x_full
+        2. Apply interpolate (nearest neighbor) on x_full
+        3. Apply standard convolution on upsampled full feature map
+        4. Split output back to chunks
         """
-        # Upsample using nearest neighbor interpolation (works locally)
-        x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+        if not (dist.is_available() and dist.is_initialized()):
+            x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+            return self.conv(x)
+
+        world_size = dist.get_world_size(self.process_group)
+        if world_size == 1:
+            x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+            return self.conv(x)
+
+        # 1. All-gather
+        x_list = [torch.empty_like(x) for _ in range(world_size)]
+        dist.all_gather(x_list, x, group=self.process_group)
+        x_full = torch.cat(x_list, dim=3)
         
-        # Apply convolution with halo exchange
-        x = self.conv(x)
+        # 2. Interpolate
+        x_up_full = nn.functional.interpolate(x_full, scale_factor=2.0, mode="nearest")
         
-        return x
+        # 3. Standard convolution
+        out_full = self.conv(x_up_full)
+        
+        # 4. Split output
+        W_global = out_full.shape[3]
+        W_local = W_global // world_size
+        rank = dist.get_rank(self.process_group)
+        start = rank * W_local
+        end = start + W_local
+        
+        return out_full[..., start:end]
 
 
 class ParallelResnetBlock(nn.Module):
