@@ -265,19 +265,42 @@ class ParallelUpsample(nn.Module):
         )
     
     def forward(self, x: Tensor) -> Tensor:
-        # x: (B, C, H, W_local)
-        # Interpolate scales H and W by 2.
-        # Since W is split, we just interpolate the local chunk.
-        # The spatial relationship is preserved because each chunk is contiguous in W.
-        # e.g. [0, 1] -> [0, 0.5, 1, 1.5]
-        # If we have [0, 1] on rank 0 and [2, 3] on rank 1
-        # Rank 0 -> [0, 0.5, 1, 1.5]
-        # Rank 1 -> [2, 2.5, 3, 3.5]
-        # This is correct for nearest neighbor or linear interpolation if aligned correctly.
-        # For 'nearest', it just duplicates pixels.
+        """
+        x: (B, C, H, W_local)
+        Use all_gather to reconstruct full input, run standard Upsample, then split.
+        This guarantees output matches baseline exactly, ignoring communication overhead.
+        """
+        # Non-distributed or not initialized
+        if (not dist.is_available()) or (not dist.is_initialized()):
+            x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+            return self.conv(x)
+
+        pg = self.process_group
+        world_size = dist.get_world_size(pg)
+        rank = dist.get_rank(pg)
+
+        if world_size == 1:
+            x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+            return self.conv(x)
+
+        # 1. Gather all input chunks
+        tensor_list = [torch.zeros_like(x) for _ in range(world_size)]
+        dist.all_gather(tensor_list, x, group=pg)
         
-        x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
-        return self.conv(x)
+        # 2. Concatenate to get full input
+        x_full = torch.cat(tensor_list, dim=3)
+        
+        # 3. Run standard Upsample (interpolate + conv)
+        x_full = nn.functional.interpolate(x_full, scale_factor=2.0, mode="nearest")
+        # Note: self.conv is a ParallelConv2d, but we want to run it as a standard Conv2d on full input
+        # ParallelConv2d.conv is the underlying nn.Conv2d
+        out_full = self.conv.conv(x_full)
+        
+        # 4. Split output back to chunks
+        out_chunks = torch.tensor_split(out_full, world_size, dim=3)
+        out_local = out_chunks[rank]
+
+        return out_local
 
 
 class ParallelResnetBlock(nn.Module):
