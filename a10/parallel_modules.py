@@ -514,4 +514,9 @@ class ParallelAutoEncoder(nn.Module):
     
     def get_last_layer(self):
         return self.decoder.conv_out.conv.weight
+    
+    def load_checkpoint(self, checkpoint_path: str):
+        from safetensors.torch import load_file
+        state_dict = load_file(checkpoint_path)
+        self.load_state_dict(state_dict)
 
