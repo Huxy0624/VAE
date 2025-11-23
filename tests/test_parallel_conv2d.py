@@ -26,7 +26,8 @@ def test_parallel_conv2d(in_channels, out_channels, kernel_size, stride, padding
     world_size = dist.get_world_size()
     process_group = dist.group.WORLD
     
-    set_seed(42 + rank)
+    # Use fixed seed to ensure inputs and weights are identical across ranks
+    set_seed(42)
     
     # Create parallel and non-parallel conv layers
     parallel_conv = ParallelConv2d(
