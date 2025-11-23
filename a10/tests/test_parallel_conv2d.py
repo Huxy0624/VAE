@@ -26,7 +26,8 @@ def test_parallel_conv2d(in_channels, out_channels, kernel_size, stride, padding
     world_size = dist.get_world_size()
     process_group = dist.group.WORLD
     
-    set_seed(42 + rank)
+    # Ensure same initialization and input across all ranks
+    set_seed(42)
     
     # Create parallel and non-parallel conv layers
     parallel_conv = ParallelConv2d(
@@ -41,6 +42,12 @@ def test_parallel_conv2d(in_channels, out_channels, kernel_size, stride, padding
         baseline_conv.weight.copy_(parallel_conv.conv.weight)
         if baseline_conv.bias is not None:
             baseline_conv.bias.copy_(parallel_conv.conv.bias)
+
+    if rank == 0:
+        w_diff = (parallel_conv.conv.weight - baseline_conv.weight).abs().max().item()
+        b_diff = (parallel_conv.conv.bias - baseline_conv.bias).abs().max().item()
+        print("[DEBUG] weight max diff:", w_diff)
+        print("[DEBUG] bias   max diff:", b_diff)
     
     # Create input
     B, C, H, W = 2, in_channels, 32, 32
@@ -65,15 +72,28 @@ def test_parallel_conv2d(in_channels, out_channels, kernel_size, stride, padding
     # Reconstruct full output
     if rank == 0:
         out_parallel_full = gather_along_width(out_parallel_list, out_baseline.shape[3])
-        
-        # Compare outputs using allclose
+
+        print("=== DEBUG CONFIG ===")
+        print("in_channels:", in_channels,
+              "out_channels:", out_channels,
+              "kernel_size:", kernel_size,
+              "stride:", stride,
+              "padding:", padding)
+        print("x_full shape:", x_full.shape)
+        print("out_baseline shape:", out_baseline.shape)
+        print("out_parallel_full shape:", out_parallel_full.shape)
+        diff = (out_parallel_full - out_baseline).abs()
+        print("max diff:", diff.max().item())
+        print("mean diff:", diff.mean().item())
+
         if not torch.allclose(out_parallel_full, out_baseline, rtol=1e-3, atol=1e-5):
-            print(f"ERROR: Parallel and baseline outputs do not match")
-            print(f"  Max diff: {(out_parallel_full - out_baseline).abs().max().item()}")
             raise AssertionError("Parallel and baseline outputs do not match")
         else:
             print(f"✓ ParallelConv2d test passed: in={in_channels}, out={out_channels}, "
                   f"kernel={kernel_size}, stride={stride}, padding={padding}")
+
+    # Wait for all ranks to finish checking
+    dist.barrier()
 
 
 def run_tests():

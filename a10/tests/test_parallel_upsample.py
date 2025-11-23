@@ -26,7 +26,7 @@ def test_parallel_upsample(in_channels):
     world_size = dist.get_world_size()
     process_group = dist.group.WORLD
     
-    set_seed(42 + rank)
+    set_seed(42)
     
     # Create parallel and baseline upsample layers
     parallel_upsample = ParallelUpsample(in_channels, process_group=process_group)
@@ -34,6 +34,8 @@ def test_parallel_upsample(in_channels):
     
     # Copy weights for fair comparison
     with torch.no_grad():
+        # ParallelUpsample uses nn.Conv2d directly as .conv
+        # Baseline Upsample uses Conv2d directly as .conv
         if hasattr(parallel_upsample, 'conv') and hasattr(baseline_upsample, 'conv'):
             baseline_upsample.conv.weight.copy_(parallel_upsample.conv.weight)
             if baseline_upsample.conv.bias is not None:
@@ -107,3 +109,4 @@ def run_all_tests():
 
 if __name__ == "__main__":
     run_all_tests()
+
